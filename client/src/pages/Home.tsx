@@ -133,7 +133,7 @@ export default function Home() {
   const [editingItem, setEditingItem] = useState<ScheduleItem | null>(null);
   const [eventForm, setEventForm] = useState<EventForm>(initialEventForm);
   const [recording, setRecording] = useState(false);
-  const [voiceReplies, setVoiceReplies] = useState(false);
+  const [voiceReplies, setVoiceReplies] = useState(() => typeof window !== "undefined" && "speechSynthesis" in window);
   const [scheduleSaving, setScheduleSaving] = useState(false);
   const recorderRef = useRef<MediaRecorder | null>(null);
   const chunksRef = useRef<Blob[]>([]);
@@ -382,7 +382,7 @@ export default function Home() {
               <div className="assistant-avatar"><Sparkles size={18} /></div>
               <div><h2>Talk it through</h2><p>Ask anything. We'll work it out together.</p></div>
             </div>
-            <button className={`quiet-toggle ${voiceReplies ? "is-on" : ""}`} onClick={() => setVoiceReplies(value => !value)} title="Toggle spoken assistant replies" aria-pressed={voiceReplies}>
+            <button className={`quiet-toggle ${voiceReplies ? "is-on" : ""}`} onClick={() => setVoiceReplies(value => !value)} title={voiceReplies ? "Mute spoken assistant replies" : "Enable spoken assistant replies"} aria-label={voiceReplies ? "Mute spoken assistant replies" : "Enable spoken assistant replies"} aria-pressed={voiceReplies}>
               <Volume2 size={15} /><span>{voiceReplies ? "Voice on" : "Voice off"}</span>
             </button>
           </div>
