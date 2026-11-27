@@ -87,14 +87,22 @@ function initialEventForm(): EventForm {
   };
 }
 
-function speak(text: string) {
-  if (!("speechSynthesis" in window)) {
+function speak(text: string, onSpeakingChange: (speaking: boolean) => void = () => {}) {
+  if (!("speechSynthesis" in window) || typeof SpeechSynthesisUtterance === "undefined") {
     toast.error("Spoken playback is not available in this browser.");
+    onSpeakingChange(false);
     return;
   }
   window.speechSynthesis.cancel();
   const utterance = new SpeechSynthesisUtterance(text.replace(/[#*_`]/g, ""));
   utterance.rate = 1.02;
+  utterance.onstart = () => onSpeakingChange(true);
+  utterance.onend = () => onSpeakingChange(false);
+  utterance.onerror = event => {
+    onSpeakingChange(false);
+    if (event.error !== "canceled" && event.error !== "interrupted") toast.error("Spoken playback was blocked. Check your browser audio settings or switch to text mode.");
+  };
+  window.speechSynthesis.resume();
   window.speechSynthesis.speak(utterance);
 }
 
@@ -106,7 +114,7 @@ function SignInScreen({ name }: { name: string }) {
         <div className="sign-in-art"><span className="art-star star-one">✳</span><span className="art-star star-two">·</span><span className="art-book"><BookOpen size={54} strokeWidth={1.4} /></span></div>
         <p className="eyebrow">YOUR PERSONAL STUDY DESK</p>
         <h1>A little more focus.<br /><em>A lot more you.</em></h1>
-        <p className="sign-in-copy">Sign in to talk things through, get unstuck on a topic, and keep your classes, deadlines, and reminders together in one calm place.</p>
+        <p className="sign-in-copy">Sign in to speak things through, get unstuck on a topic, and keep your classes, deadlines, and reminders together in one calm place.</p>
         <button className="primary-button sign-in-button" onClick={startLogin}>Continue with Manus <ArrowUpRight size={16} /></button>
         <p className="privacy-note">Your schedule is private to your signed-in account.</p>
         <span className="greeting-name">Made for {name}</span>
@@ -132,8 +140,10 @@ export default function Home() {
   const [editorOpen, setEditorOpen] = useState(false);
   const [editingItem, setEditingItem] = useState<ScheduleItem | null>(null);
   const [eventForm, setEventForm] = useState<EventForm>(initialEventForm);
+  const [conversationMode, setConversationMode] = useState<"voice" | "text">("voice");
   const [recording, setRecording] = useState(false);
-  const [voiceReplies, setVoiceReplies] = useState(false);
+  const [voiceReplies, setVoiceReplies] = useState(true);
+  const [speaking, setSpeaking] = useState(false);
   const [scheduleSaving, setScheduleSaving] = useState(false);
   const recorderRef = useRef<MediaRecorder | null>(null);
   const chunksRef = useRef<Blob[]>([]);
@@ -162,6 +172,8 @@ export default function Home() {
   }).length;
   const nextItem = scheduledItems.find(item => item.startAt.getTime() >= Date.now()) ?? scheduledItems[0];
   const firstName = auth.user?.name?.trim().split(/\s+/)[0] || "Student";
+  const latestAssistantReply = [...chatMessages].reverse().find(message => message.role === "assistant");
+  const voiceStatus = recording ? "Listening to you" : transcribeMutation.isPending ? "Preparing your voice message" : chatMutation.isPending ? "Thinking it through" : speaking ? "Jarvis is speaking" : "Ready when you are";
   const timezone = Intl.DateTimeFormat().resolvedOptions().timeZone;
   const todayString = new Intl.DateTimeFormat("en-US", { weekday: "long", month: "long", day: "numeric" }).format(new Date());
 
@@ -180,12 +192,14 @@ export default function Home() {
       const reply: ChatMessage = { id: crypto.randomUUID(), role: "assistant", content: response.reply };
       setChatMessages(current => [...current, reply]);
       if (response.scheduleChanged) await utils.schedule.list.invalidate();
-      if (voiceReplies) speak(response.reply);
+      if (voiceReplies) speak(response.reply, setSpeaking);
     } catch (error) {
       console.error("Study Jarvis chat failed", error);
       const message = error instanceof Error ? error.message : "Please try that again.";
       toast.error(message);
-      setChatMessages(current => [...current, { id: crypto.randomUUID(), role: "assistant", content: "I couldn't reach the assistant just now. Your message is still here—please try again, or keep studying while I reconnect." }]);
+      const failureReply = "I couldn't reach the assistant just now. Please try again in a moment.";
+      setChatMessages(current => [...current, { id: crypto.randomUUID(), role: "assistant", content: failureReply }]);
+      if (voiceReplies) speak(failureReply, setSpeaking);
     }
   };
 
@@ -264,12 +278,12 @@ export default function Home() {
       return;
     }
     if (blob.size < 1200) {
-      toast.error("I didn't catch enough speech. Please try again or type your request.");
+      toast.error("I didn't catch enough speech. Tap the microphone and try again.");
       return;
     }
     const mimeType = blob.type.split(";")[0].toLowerCase();
     if (!["audio/webm", "audio/mp4", "audio/mpeg", "audio/mp3", "audio/wav", "audio/wave", "audio/x-wav", "audio/ogg", "audio/x-m4a"].includes(mimeType)) {
-      toast.error("This browser recorded an unsupported audio format. Please try another browser or type your request.");
+      toast.error("This browser recorded an unsupported audio format. Try another supported browser or switch to text mode.");
       return;
     }
     const reader = new FileReader();
@@ -279,10 +293,14 @@ export default function Home() {
         const dataUrl = String(reader.result ?? "");
         const audioBase64 = dataUrl.slice(dataUrl.indexOf(",") + 1);
         const result = await transcribeMutation.mutateAsync({ audioBase64, mimeType: blob.type });
-        setDraft(current => current ? `${current.trim()} ${result.text}` : result.text);
-        toast.success("Voice note transcribed. Review it, then send when ready.");
+        const transcript = result.text.trim();
+        if (!transcript) {
+          toast.info("I didn't catch any words. Tap the microphone and try again.");
+          return;
+        }
+        void sendMessage(transcript);
       } catch (error) {
-        toast.error(error instanceof Error ? error.message : "Transcription failed. You can type your request instead.");
+        toast.error(error instanceof Error ? error.message : "I couldn't understand that recording. Please try again or switch to text mode.");
       }
     };
     reader.readAsDataURL(blob);
@@ -290,7 +308,7 @@ export default function Home() {
 
   const startRecording = async () => {
     if (!navigator.mediaDevices?.getUserMedia || typeof MediaRecorder === "undefined") {
-      toast.error("Voice recording isn't supported here. You can type your request instead.");
+      toast.error("Voice recording isn't supported here. Check microphone access or switch to text mode.");
       return;
     }
     try {
@@ -307,6 +325,8 @@ export default function Home() {
         setRecording(false);
         if (stopTimerRef.current !== null) window.clearTimeout(stopTimerRef.current);
         stopTimerRef.current = null;
+        stream.getTracks().forEach(track => track.stop());
+        streamRef.current = null;
         toast.error("Recording stopped unexpectedly. Please try again.");
       };
       recorder.onstop = () => {
@@ -314,6 +334,7 @@ export default function Home() {
         stopTimerRef.current = null;
         stream.getTracks().forEach(track => track.stop());
         streamRef.current = null;
+        recorderRef.current = null;
         setRecording(false);
         if (recordingFailed) {
           chunksRef.current = [];
@@ -336,7 +357,7 @@ export default function Home() {
       streamRef.current?.getTracks().forEach(track => track.stop());
       streamRef.current = null;
       console.warn("Microphone permission or recording error", error);
-      toast.error("Microphone access was unavailable. Check browser permission, or type your request instead.");
+      toast.error("Microphone access was unavailable. Check your browser permission or switch to text mode.");
     }
   };
 
@@ -344,6 +365,11 @@ export default function Home() {
     if (stopTimerRef.current !== null) window.clearTimeout(stopTimerRef.current);
     stopTimerRef.current = null;
     if (recorderRef.current?.state === "recording") recorderRef.current.stop();
+  };
+
+  const stopSpeaking = () => {
+    if ("speechSynthesis" in window) window.speechSynthesis.cancel();
+    setSpeaking(false);
   };
 
   if (auth.loading) {
@@ -380,15 +406,33 @@ export default function Home() {
           <div className="panel-heading assistant-heading">
             <div className="assistant-title-wrap">
               <div className="assistant-avatar"><Sparkles size={18} /></div>
-              <div><h2>Talk it through</h2><p>Ask anything. We'll work it out together.</p></div>
+              <div><h2>Talk with Jarvis</h2><p>Speak naturally. Replies are spoken aloud.</p></div>
             </div>
-            <button className={`quiet-toggle ${voiceReplies ? "is-on" : ""}`} onClick={() => setVoiceReplies(value => !value)} title="Toggle spoken assistant replies" aria-pressed={voiceReplies}>
-              <Volume2 size={15} /><span>{voiceReplies ? "Voice on" : "Voice off"}</span>
+            <button className={`quiet-toggle ${voiceReplies ? "is-on" : ""}`} onClick={() => { const next = !voiceReplies; setVoiceReplies(next); if (!next) stopSpeaking(); }} title={voiceReplies ? "Mute spoken assistant replies" : "Enable spoken assistant replies"} aria-pressed={voiceReplies}>
+              <Volume2 size={15} /><span>{voiceReplies ? "Voice replies on" : "Voice replies off"}</span>
             </button>
           </div>
 
           <div className="chat-area" aria-live="polite">
-            {chatMessages.length === 0 ? (
+            {conversationMode === "voice" ? (
+              <div className={`voice-stage ${recording ? "is-listening" : speaking ? "is-speaking" : ""}`}>
+                <div className={`voice-orb ${recording ? "is-listening" : speaking ? "is-speaking" : ""}`} aria-hidden="true">
+                  {recording ? <Mic size={25} /> : speaking ? <Volume2 size={25} /> : chatMutation.isPending || transcribeMutation.isPending ? <Loader2 size={25} className="spin" /> : <Sparkles size={25} />}
+                </div>
+                <p className="voice-status" aria-live="polite">{voiceStatus}</p>
+                <p className="voice-instructions">{recording ? "Say what you need, then stop to send it." : "Tap to speak. Your request is sent automatically, and Jarvis speaks the reply."}</p>
+                <div className="voice-controls">
+                  <button type="button" className={`voice-talk-button ${recording ? "recording" : ""}`} onClick={() => { if (recording) stopRecording(); else { if (speaking) stopSpeaking(); void startRecording(); } }} disabled={transcribeMutation.isPending || chatMutation.isPending} aria-label={recording ? "Stop recording and send voice request" : speaking ? "Interrupt and speak to Study Jarvis" : "Start speaking to Study Jarvis"}>
+                    {recording ? <MicOff size={19} /> : <Mic size={19} />}<span>{recording ? "Stop & send" : speaking ? "Interrupt & talk" : "Tap to talk"}</span>
+                  </button>
+                  {speaking ? <button type="button" className="voice-utility-button" onClick={stopSpeaking}><Volume2 size={15} /> Stop reply</button> : latestAssistantReply && voiceReplies ? <button type="button" className="voice-utility-button" onClick={() => speak(latestAssistantReply.content, setSpeaking)}><Volume2 size={15} /> Repeat reply</button> : null}
+                </div>
+                <div className="voice-mode-links">
+                  <button type="button" onClick={() => setConversationMode("text")} disabled={recording || transcribeMutation.isPending || chatMutation.isPending}><Pencil size={13} /> Use text instead</button>
+                  <span>Voice input is sent after you stop recording.</span>
+                </div>
+              </div>
+            ) : chatMessages.length === 0 ? (
               <div className="chat-empty-state">
                 <div className="empty-orbit"><span className="orbit-dot" /><Sparkles size={22} /></div>
                 <p className="empty-kicker">A clear mind starts somewhere</p>
@@ -416,9 +460,7 @@ export default function Home() {
             )}
           </div>
 
-          <form className="composer" onSubmit={event => { event.preventDefault(); void sendMessage(); }}>
-            {recording && <div className="recording-indicator"><span className="recording-pulse" />Listening… tap the mic to finish</div>}
-            {transcribeMutation.isPending && <div className="recording-indicator transcription-status"><Loader2 size={13} className="spin" />Turning your voice into text…</div>}
+          {conversationMode === "text" && <form className="composer" onSubmit={event => { event.preventDefault(); void sendMessage(); }}>
             <label className="sr-only" htmlFor="assistant-input">Message Study Jarvis</label>
             <textarea
               id="assistant-input"
@@ -430,18 +472,15 @@ export default function Home() {
               disabled={chatMutation.isPending || transcribeMutation.isPending}
             />
             <div className="composer-toolbar">
-              <span className="composer-hint">Enter to send <span>·</span> Shift + Enter for a new line</span>
+              <button type="button" className="text-mode-switch" onClick={() => setConversationMode("voice")}><Mic size={13} /> Switch to voice</button>
               <div className="composer-actions">
-                <button type="button" className={`icon-button mic-button ${recording ? "recording" : ""}`} onClick={() => recording ? stopRecording() : void startRecording()} disabled={transcribeMutation.isPending || chatMutation.isPending} aria-label={recording ? "Stop recording" : "Record a voice request"} title={recording ? "Stop recording" : "Record a voice request"}>
-                  {recording ? <MicOff size={17} /> : <Mic size={17} />}
-                </button>
                 <button type="submit" className="send-button" disabled={!draft.trim() || chatMutation.isPending || transcribeMutation.isPending} aria-label="Send message">
                   {chatMutation.isPending ? <Loader2 size={16} className="spin" /> : <Send size={16} />}<span>Send</span>
                 </button>
               </div>
             </div>
-          </form>
-          <div className="assistant-footnote"><span className="footnote-spark">✳</span> Voice notes are transcribed for you—review the text before sending. <span className="footnote-separator">·</span> AI can make mistakes.</div>
+          </form>}
+          <div className="assistant-footnote"><span className="footnote-spark">✳</span> {conversationMode === "voice" ? "Tap to talk; stop to send. Jarvis speaks replies automatically." : "Text mode is available whenever you need it."} <span className="footnote-separator">·</span> AI can make mistakes.</div>
         </section>
 
         <aside className="schedule-panel paper-panel" aria-label="Personal schedule">
